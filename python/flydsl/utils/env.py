@@ -294,6 +294,10 @@ class RuntimeEnvManager(EnvManager):
     )
     cache_dir = OptStr(str(Path.home() / ".flydsl" / "cache"), description="Directory for caching compiled kernels")
     enable_cache = OptBool(True, description="Enable kernel caching")
+    record_jit = OptBool(
+        False, description="Record successful JIT misses under cache_dir/jit-records for startup replay"
+    )
+    replay_jit = OptBool(False, description="Automatically compile recorded JIT inputs before the first JIT call")
     run_only = OptBool(
         False,
         description=("Skip JIT compilation; only load AOT cache. " "Raise RuntimeError on cache miss."),

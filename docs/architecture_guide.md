@@ -461,6 +461,8 @@ Transforms Python control flow to MLIR ops at the AST level:
 |---|---|---|
 | `FLYDSL_RUNTIME_CACHE_DIR` | `~/.flydsl/cache` | Directory for caching compiled kernels. |
 | `FLYDSL_RUNTIME_ENABLE_CACHE` | `true` | Enable kernel disk caching (in-memory cache is always active). |
+| `FLYDSL_RUNTIME_RECORD_JIT` | `false` | Record successful JIT misses as compressed source recipes under `CACHE_DIR/jit-records` for `flydsl.compiler.replay_jit_records()`. |
+| `FLYDSL_RUNTIME_REPLAY_JIT` | `false` | Automatically compile `CACHE_DIR/jit-records` before each process's first JIT call; retain results in memory. |
 
 ### 5.4 Architecture detection priority
 

@@ -35,6 +35,115 @@ The primary API for defining and compiling kernels:
 - ``@flyc.jit`` wraps a host-side function that constructs and launches kernels.
   On first call it triggers JIT compilation; subsequent calls with the same type
   signature use a cached compiled artifact.
+- ``launch.preload(*args)`` compiles or reads the cached specialization and
+  initializes its execution engine without invoking the launcher. Call it in
+  the worker after selecting its GPU; later calls reuse the loaded artifact.
+  It returns a ``CompiledFunction`` and does not change process-wide flags.
+  Use the returned callable to also skip tracing on subsequent calls.
+  With ``COMPILE_ONLY=1``, it compiles without creating an engine and returns
+  ``None`` instead.
+
+``JitPlan`` saves a small JSON list of recipe names and parameters, rather than
+shipping compiled cache files. Record recipes explicitly where the application
+constructs its kernel variants. At startup, application-provided factories
+reconstruct the launchers and their arguments as ``JitCall`` objects:
+
+.. code-block:: python
+
+   import torch
+
+   plan = flyc.JitPlan()
+   plan.add("my_launch.v1", n=256)
+   plan.add("my_launch.v1", n=512)
+   plan.save("jit-plan.json")
+
+   def rebuild_launch(n):
+       # Reconstruct all tensor type/layout and constexpr information here.
+       # These CPU placeholders are never passed to a kernel invocation.
+       a = torch.empty((n,), dtype=torch.float32, device="cpu")
+       b = torch.empty((n,), dtype=torch.float32, device="cpu")
+       return flyc.JitCall(launch, (a, b, n, fx.Stream(None)))
+
+   plan = flyc.JitPlan.load("jit-plan.json")
+   factories = {"my_launch.v1": rebuild_launch}
+   compiled = plan.compile(factories)  # no execution engine or kernel launch
+   # Or, inside each worker after selecting its GPU:
+   ready = plan.preload(factories)     # also initialize execution engines
+
+Identical recipe/parameter entries are deduplicated. Parameters must be plain
+JSON values; tensor data, pointers, Python code and closures are not saved.
+Factories must come from compatible application code and reproduce all
+compilation inputs, including bound instances or closures when needed. The list
+must also account for compile hints used by the application. It does not
+automatically discover kernel variants. Missing factory names are
+rejected before compilation, and compilation errors propagate to the caller.
+
+A plan moves compilation to startup; it does not eliminate compilation on a
+fresh machine. Existing local cache hits still work. To avoid writing local
+binary caches too, set ``FLYDSL_RUNTIME_ENABLE_CACHE=0`` and
+``FLYDSL_RUNTIME_RUN_ONLY=0`` before starting the worker. The plan never changes
+these process-wide settings. Keep and reuse the returned callables, or have
+factories return the same JIT function instances used later by the model;
+separate launcher instances cannot share in-memory artifacts without disk cache.
+
+For automatic recording without application factories, set
+``FLYDSL_RUNTIME_RECORD_JIT=1`` before running the workload. Only successful
+JIT compilation misses create records; memory hits, disk hits (including hits
+after waiting for another compiler), and failed compilations do not. Each
+launcher specialization is deduplicated by its compilation key and atomically
+written to ``$FLYDSL_RUNTIME_CACHE_DIR/jit-records/<key>.json.gz``. The default
+directory is ``~/.flydsl/cache/jit-records``. Multiple workers can share it.
+Recording also works with ``FLYDSL_RUNTIME_ENABLE_CACHE=0``: only the records,
+not compiled binary caches, are written in that case.
+
+These automatic records contain compressed, pre-lowering MLIR and compilation
+settings, rather than just recipe parameters. This captures closures and kernel
+variants without importing the original application during replay. It contains
+no compiled device binary or runtime tensor storage, but does include constants
+embedded in the compilation input. Its size depends on the IR and is not
+guaranteed to be smaller than a compiled cache. The explicit ``JitPlan`` API
+above remains the smaller option when application factories are available.
+Copy only the ``jit-records`` directory to the next worker. For automatic replay,
+set ``FLYDSL_RUNTIME_REPLAY_JIT=1``. Each process checks the directory before its
+first outer JIT/compile call and compiles the recorded variants before continuing
+that call. No replay runs at Python import time. FlyDSL keeps the replay handle
+alive internally, so ``FLYDSL_RUNTIME_ENABLE_CACHE=0`` needs no application code.
+Automatic replay only compiles; execution engines are initialized on use.
+
+The check runs once per process, cache directory, target and compilation/cache
+configuration. A missing or empty directory continues with ordinary JIT and is
+not rescanned on later calls in that scope. Consequently ``RECORD_JIT=1`` and
+``REPLAY_JIT=1`` can be used together: the first cold run records, and the next
+process replays. New variants still compile and can be recorded normally.
+Concurrent callers wait for the same startup batch. Forked children reset the
+automatic replay state and locks. Invalid records or compilation failures stop
+the call and remain failed for that scope; fix the cause and restart the worker.
+This moves batch compilation to the first FlyDSL use, usually model loading or
+warmup; if the first use occurs in a serving request, that request pays the cost.
+
+Alternatively, explicitly trigger replay at a chosen startup point:
+
+.. code-block:: python
+
+   # Defaults to the configured cache directory's jit-records subdirectory.
+   startup_jit = flyc.replay_jit_records()
+   # Or, after GPU selection, also initialize execution engines:
+   # startup_jit = flyc.replay_jit_records("/path/to/jit-records", preload=True)
+
+Keep ``startup_jit`` alive for the worker's lifetime. Normal JIT calls trace and
+reuse matching replayed artifacts, even with disk caching disabled and with
+newly reconstructed launcher instances. Replay respects existing local cache
+hits, ``RUN_ONLY`` and ``COMPILE_ONLY``; it does not launch kernels or change
+environment variables. Recompilation still costs time at startup.
+
+Replay requires matching compiler/toolchain, target and compilation environment;
+it validates every record before beginning compilation. Treat records as trusted
+kernel source code. Extern-linked kernels, post-load initializers and ktrace
+event registration require application factories: their JIT occurrences are
+recorded with an explicit unsupported reason, and automatic replay rejects them
+instead of omitting initialization. Failed record writes emit a warning without
+discarding the successful compilation. Recording is off by default; enabling it
+after a cache is already warm does not backfill entries.
 
 Compilation flow
 -----------------

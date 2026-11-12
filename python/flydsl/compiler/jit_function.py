@@ -44,6 +44,7 @@ from .jit_argument import (
     resolve_signature,
 )
 from .jit_executor import CallState, CompiledArtifact
+from .jit_record import _get_replayed_artifact, _maybe_replay_jit_records, _record_compilation
 from .kernel_function import (
     CompilationContext,
     create_gpu_module,
@@ -976,7 +977,9 @@ class JitFunction:
         # first positional argument.
         if obj is None:
             return self
-        return partial(self.__call__, obj)
+        bound = partial(self.__call__, obj)
+        bound.preload = partial(self.preload, obj)
+        return bound
 
     def _effective_compile_hints(self):
         """Resolve persistent defaults and the current thread-local overlay."""
@@ -1136,6 +1139,27 @@ class JitFunction:
         """Compile one specialization without creating an engine or running it."""
         return self._compile_or_execute(args, kwargs, execute=False)
 
+    def preload(self, *args, **kwargs) -> Optional["CompiledFunction"]:
+        """Compile and materialize this specialization without launching kernels.
+
+        Call in the worker process after selecting its device. Artifacts stay
+        owned by this JitFunction, so the following normal call reuses the same
+        execution engine. COMPILE_ONLY retains CPU-only compilation behavior.
+        Invoke the returned callable to also avoid retracing the launcher.
+        Even placeholder-only arguments require the selected device unless
+        COMPILE_ONLY is enabled. This method never changes environment variables.
+        """
+        if ir.Context.current is not None:
+            raise RuntimeError("JitFunction.preload() cannot run during DSL tracing")
+        compiled = self._compile_or_execute(args, kwargs, execute=False, return_compiled=True)
+        if env.compile.compile_only:
+            return None
+        from ..runtime.device_runtime import ensure_compile_runtime_pairing_from_env
+
+        ensure_compile_runtime_pairing_from_env(compiled._backend)
+        compiled._keepalive._get_func_exe()
+        return compiled
+
     def _compile_or_execute(self, args, kwargs, *, execute: bool, return_compiled: bool = False):
         if ir.Context.current is not None:
             return self.func(*args, **kwargs)
@@ -1165,6 +1189,9 @@ class JitFunction:
             from ..runtime.device_runtime import ensure_compile_runtime_pairing_from_env
 
             ensure_compile_runtime_pairing_from_env(backend.target.backend)
+
+        if env.runtime.replay_jit:
+            _maybe_replay_jit_records(backend)
 
         from ..expr import ktrace as _ktrace
         from ..expr.ktrace_common import EventNameConflict, name_assignment_lock, name_table
@@ -1207,6 +1234,8 @@ class JitFunction:
             dumping = env.debug.dump_ir or env.debug.dump_asm
             manager = None if traced.post_load_processors or dumping else self.cache_manager
             compiled_func = self._mem_cache.get(cache_key)
+            if compiled_func is None:
+                compiled_func = _get_replayed_artifact(cache_key)
             disk_key = None if manager is None else _disk_cache_key(cache_key)
             if compiled_func is None and manager is not None:
                 compiled_func = manager.get(disk_key)
@@ -1250,6 +1279,14 @@ class JitFunction:
                         )
                         _capture_ktrace_names(compiled_func, traced.has_ktrace_buf, compiled_module)
                         compiled_func._ktrace_traced = traced.has_ktrace_buf
+                        if env.runtime.record_jit:
+                            _record_compilation(
+                                cache_key,
+                                asm,
+                                config,
+                                backend,
+                                compiled_func,
+                            )
                         if writer:
                             try:
                                 writer(compiled_func)
